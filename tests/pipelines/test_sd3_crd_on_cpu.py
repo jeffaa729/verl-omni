@@ -19,7 +19,15 @@ from unittest.mock import MagicMock
 import torch
 from tensordict import TensorDict
 
+from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.sd3_crd.diffusers_training_adapter import StableDiffusion3CRD
+from verl_omni.pipelines.sd3_crd.vllm_omni_rollout_adapter import StableDiffusion3CRDPipeline
+
+
+def test_registered_crd_rollout_supports_request_batching():
+    pipeline = VllmOmniPipelineBase.get_class("StableDiffusion3Pipeline", "crd")
+    assert pipeline is StableDiffusion3CRDPipeline
+    assert pipeline.supports_request_batch is True
 
 
 def test_anchor_cfg_does_not_change_policy_forward():

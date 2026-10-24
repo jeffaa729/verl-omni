@@ -24,4 +24,5 @@ __all__ = ["StableDiffusion3CRDPipeline"]
 class StableDiffusion3CRDPipeline(StableDiffusion3DGPOPipeline):
     """ODE samples with clean latents for centered reward distillation."""
 
+    supports_request_batch = True
     always_encode_negative_prompt = True
