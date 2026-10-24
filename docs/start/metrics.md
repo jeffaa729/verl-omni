@@ -102,3 +102,12 @@ and the group weight is $w_G = \sigma(s_G)$.
 **Variables.** $A_i$ — clipped group-normalized advantage; $\beta$ — `dgpo_beta`; $\epsilon_c$ —
 `dgpo_clip_range`; $\lambda$ — `ref_kl_coef`; $v_\theta$, $v_\mathrm{ref}$ — velocities of the
 trained and reference policies.
+
+
+## CRD
+
+CRD reports `actor/crd_policy_loss` (centered reward matching), `actor/crd_kl_loss` (the weighted pretrained-anchor
+penalty), `actor/crd_loss` (their sum), `actor/crd_kl_coefficient` (mean reward-adaptive anchor coefficient), and
+`actor/crd_implicit_reward` (mean estimated model reward before centering). Interpret these alongside held-out OCR
+rewards and image quality; a falling training loss alone does not establish improvement. Sampling EMA updates use
+the existing old-policy metrics. The moving reference uses its independently configured EMA schedule.
