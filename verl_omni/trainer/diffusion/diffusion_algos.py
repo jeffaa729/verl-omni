@@ -1522,7 +1522,57 @@ class DGPOLoss(DiffusionLossFn):
         groups from the v1 sampler, the unstaged NFT engine path, and training timesteps that fit the rollout
         schedule.
         """
-        _validate_group_forward_config(config, loss_name="DGPO")
+        actor_cfg = config.actor_rollout_ref.actor
+        model_cfg = config.actor_rollout_ref.model
+        rollout_cfg = config.actor_rollout_ref.rollout
+        n = int(rollout_cfg.n)
+        micro = actor_cfg.get("ppo_micro_batch_size_per_gpu", None)
+        sp_size = OmegaConf.select(actor_cfg, "fsdp_config.ulysses_sequence_parallel_size", default=1) or 1
+        dp_size = int(config.trainer.n_gpus_per_node) * int(config.trainer.nnodes) // int(sp_size)
+        use_v1 = bool(OmegaConf.select(config, "trainer.use_v1", default=False))
+        update_prompts = int(config.data.train_batch_size)
+        if use_v1:
+            mode = OmegaConf.select(config, "trainer.v1.trainer_mode", default="sync")
+            update_prompts //= int(OmegaConf.select(config, f"trainer.v1.{mode}.parameter_sync_step", default=1) or 1)
+        problems = []
+        if micro is None or int(micro) % n != 0:
+            problems.append(f"ppo_micro_batch_size_per_gpu={micro} must be a multiple of rollout.n={n}")
+        if int(actor_cfg.ppo_mini_batch_size) % dp_size != 0:
+            mini = actor_cfg.ppo_mini_batch_size
+            problems.append(f"ppo_mini_batch_size={mini} must be divisible by dp size {dp_size}")
+        if update_prompts % dp_size != 0:
+            problems.append(f"the {update_prompts} prompts per actor update must be divisible by dp size {dp_size}")
+        if actor_cfg.get("use_dynamic_bsz", False):
+            problems.append("use_dynamic_bsz must be False")
+        if not int(model_cfg.get("lora_rank", 0) or 0) > 0:
+            problems.append("actor_rollout_ref.model.lora_rank must be > 0 (DGPO trains LoRA adapters)")
+        if "old" not in tuple(model_cfg.get("policy_state_adapters", ("default",))):
+            problems.append('actor_rollout_ref.model.policy_state_adapters must include "old"')
+        if rollout_cfg.get("rollout_adapter", None) != "old":
+            problems.append("actor_rollout_ref.rollout.rollout_adapter must be old")
+        if actor_cfg.get("use_kl_loss", False):
+            problems.append("actor_rollout_ref.actor.use_kl_loss must be False (use diffusion_loss.ref_kl_coef)")
+        if actor_cfg.get("enable_timestep_staging", False):
+            problems.append("actor_rollout_ref.actor.enable_timestep_staging must be False")
+        if use_v1 and not OmegaConf.select(config, "trainer.v1.sampler.drop_incomplete_groups", default=False):
+            problems.append("trainer.v1.sampler.drop_incomplete_groups must be True so groups arrive complete")
+        num_steps = OmegaConf.select(rollout_cfg, "pipeline.num_inference_steps", default=None)
+        timestep_range = OmegaConf.select(config, "algorithm.train_timestep_range", default=None)
+        count = OmegaConf.select(config, "algorithm.train_timestep_count", default=None)
+        if num_steps is not None:
+            num_steps = int(num_steps)
+            if timestep_range is None:
+                start, end = 0, num_steps
+            elif len(timestep_range) == 2:
+                start, end = int(timestep_range[0]), int(timestep_range[1])
+            else:
+                start, end = 0, 0
+            if not 0 <= start < end <= num_steps:
+                problems.append(f"train_timestep_range {timestep_range} must satisfy 0 <= start < end <= {num_steps}")
+            elif count is not None and not 1 <= int(count) <= end - start:
+                problems.append(f"train_timestep_count={count} must be between 1 and {end - start}, the range width")
+        if problems:
+            raise ValueError("DGPO config is not supported: " + "; ".join(problems) + ".")
 
     @staticmethod
     def _first_appearance_index(uid: np.ndarray) -> np.ndarray:
@@ -1567,117 +1617,54 @@ class DGPOLoss(DiffusionLossFn):
         config: Any,
     ) -> DataProto:
         """Turn ODE rollouts into DGPO actor tensors: advantages, groups, shared timesteps and noise."""
-        return _prepare_group_forward_batch(batch, reward_tensor, config, share_noise=True)
+        algorithm_cfg = config.algorithm
+        if "uid" not in batch.non_tensor_batch:
+            raise ValueError("DGPO actor batch requires `uid` in non_tensor_batch.")
+        if "latents_clean" not in batch.batch.keys():
+            raise ValueError("DGPO actor batch requires `latents_clean` from rollout.")
+        timestep_key = next((key for key in ("train_timesteps", "all_timesteps") if key in batch.batch.keys()), None)
+        if timestep_key is None:
+            raise ValueError("DGPO actor batch requires `train_timesteps` or `all_timesteps` from rollout.")
 
+        # Micro batches are contiguous slices, so groups must be contiguous. Rollouts usually are already
+        # (prompts repeated n times in place); only then is the batch left in its original order.
+        group_index = DGPOLoss._first_appearance_index(batch.non_tensor_batch["uid"])
+        if np.any(np.diff(group_index) < 0):
+            order = np.argsort(group_index, kind="stable")
+            batch.reorder(torch.from_numpy(order))
+            reward_tensor = reward_tensor[torch.from_numpy(order).to(reward_tensor.device)]
+            group_index = group_index[order]
 
-def _validate_group_forward_config(config: Any, *, loss_name: str) -> None:
-    """Validate whole-group LoRA placement for forward-process training."""
-    actor_cfg = config.actor_rollout_ref.actor
-    model_cfg = config.actor_rollout_ref.model
-    rollout_cfg = config.actor_rollout_ref.rollout
-    n = int(rollout_cfg.n)
-    micro = actor_cfg.get("ppo_micro_batch_size_per_gpu", None)
-    sp_size = OmegaConf.select(actor_cfg, "fsdp_config.ulysses_sequence_parallel_size", default=1) or 1
-    dp_size = int(config.trainer.n_gpus_per_node) * int(config.trainer.nnodes) // int(sp_size)
-    use_v1 = bool(OmegaConf.select(config, "trainer.use_v1", default=False))
-    update_prompts = int(config.data.train_batch_size)
-    if use_v1:
-        mode = OmegaConf.select(config, "trainer.v1.trainer_mode", default="sync")
-        update_prompts //= int(OmegaConf.select(config, f"trainer.v1.{mode}.parameter_sync_step", default=1) or 1)
-    problems = []
-    if micro is None or int(micro) % n != 0:
-        problems.append(f"ppo_micro_batch_size_per_gpu={micro} must be a multiple of rollout.n={n}")
-    if int(actor_cfg.ppo_mini_batch_size) % dp_size != 0:
-        mini = actor_cfg.ppo_mini_batch_size
-        problems.append(f"ppo_mini_batch_size={mini} must be divisible by dp size {dp_size}")
-    if update_prompts % dp_size != 0:
-        problems.append(f"the {update_prompts} prompts per actor update must be divisible by dp size {dp_size}")
-    if actor_cfg.get("use_dynamic_bsz", False):
-        problems.append("use_dynamic_bsz must be False")
-    if not int(model_cfg.get("lora_rank", 0) or 0) > 0:
-        problems.append(f"actor_rollout_ref.model.lora_rank must be > 0 ({loss_name} trains LoRA adapters)")
-    if "old" not in tuple(model_cfg.get("policy_state_adapters", ("default",))):
-        problems.append('actor_rollout_ref.model.policy_state_adapters must include "old"')
-    if rollout_cfg.get("rollout_adapter", None) != "old":
-        problems.append("actor_rollout_ref.rollout.rollout_adapter must be old")
-    if actor_cfg.get("use_kl_loss", False):
-        problems.append("actor_rollout_ref.actor.use_kl_loss must be False (use diffusion_loss.ref_kl_coef)")
-    if actor_cfg.get("enable_timestep_staging", False):
-        problems.append("actor_rollout_ref.actor.enable_timestep_staging must be False")
-    if use_v1 and not OmegaConf.select(config, "trainer.v1.sampler.drop_incomplete_groups", default=False):
-        problems.append("trainer.v1.sampler.drop_incomplete_groups must be True so groups arrive complete")
-    num_steps = OmegaConf.select(rollout_cfg, "pipeline.num_inference_steps", default=None)
-    timestep_range = OmegaConf.select(config, "algorithm.train_timestep_range", default=None)
-    count = OmegaConf.select(config, "algorithm.train_timestep_count", default=None)
-    if num_steps is not None:
-        num_steps = int(num_steps)
-        if timestep_range is None:
-            start, end = 0, num_steps
-        elif len(timestep_range) == 2:
-            start, end = int(timestep_range[0]), int(timestep_range[1])
-        else:
-            start, end = 0, 0
-        if not 0 <= start < end <= num_steps:
-            problems.append(f"train_timestep_range {timestep_range} must satisfy 0 <= start < end <= {num_steps}")
-        elif count is not None and not 1 <= int(count) <= end - start:
-            problems.append(f"train_timestep_count={count} must be between 1 and {end - start}, the range width")
-    if problems:
-        raise ValueError(f"{loss_name} config is not supported: " + "; ".join(problems) + ".")
+        uid = batch.non_tensor_batch["uid"]
+        counts = np.bincount(group_index)
+        group_size = torch.from_numpy(counts[group_index]).long()
+        group_index = torch.from_numpy(group_index).long()
 
+        advantages = DiffusionNFTLoss._compute_group_advantages(
+            rewards=reward_tensor,
+            uid=uid,
+            norm_by_std=algorithm_cfg.norm_adv_by_std_in_grpo,
+            global_std=algorithm_cfg.global_std,
+        )
+        train_timesteps = DGPOLoss._select_shared_timesteps(
+            batch.batch[timestep_key],
+            timestep_range=getattr(algorithm_cfg, "train_timestep_range", None),
+            count=getattr(algorithm_cfg, "train_timestep_count", None),
+            timestep_fraction=algorithm_cfg.timestep_fraction,
+        )
+        latents = batch.batch["latents_clean"]
+        num_steps = train_timesteps.shape[1]
+        group_noise = torch.randn(int(counts.size), num_steps, *latents.shape[1:], dtype=torch.float32)
+        forward_noise = group_noise[group_index]
 
-def _prepare_group_forward_batch(
-    batch: DataProto, reward_tensor: torch.Tensor, config: Any, *, share_noise: bool
-) -> DataProto:
-    """Prepare contiguous groups for DGPO and CRD forward-process losses."""
-    algorithm_cfg = config.algorithm
-    if "uid" not in batch.non_tensor_batch:
-        raise ValueError("Forward-process actor batch requires `uid` in non_tensor_batch.")
-    if "latents_clean" not in batch.batch.keys():
-        raise ValueError("Forward-process actor batch requires `latents_clean` from rollout.")
-    timestep_key = next((key for key in ("train_timesteps", "all_timesteps") if key in batch.batch.keys()), None)
-    if timestep_key is None:
-        raise ValueError("Forward-process actor batch requires `train_timesteps` or `all_timesteps` from rollout.")
-
-    # Micro batches are contiguous slices, so groups must be contiguous. Rollouts usually are already
-    # (prompts repeated n times in place); only then is the batch left in its original order.
-    group_index = DGPOLoss._first_appearance_index(batch.non_tensor_batch["uid"])
-    if np.any(np.diff(group_index) < 0):
-        order = np.argsort(group_index, kind="stable")
-        batch.reorder(torch.from_numpy(order))
-        reward_tensor = reward_tensor[torch.from_numpy(order).to(reward_tensor.device)]
-        group_index = group_index[order]
-
-    uid = batch.non_tensor_batch["uid"]
-    counts = np.bincount(group_index)
-    group_size = torch.from_numpy(counts[group_index]).long()
-    group_index = torch.from_numpy(group_index).long()
-
-    advantages = DiffusionNFTLoss._compute_group_advantages(
-        rewards=reward_tensor,
-        uid=uid,
-        norm_by_std=algorithm_cfg.norm_adv_by_std_in_grpo,
-        global_std=algorithm_cfg.global_std,
-    )
-    train_timesteps = DGPOLoss._select_shared_timesteps(
-        batch.batch[timestep_key],
-        timestep_range=getattr(algorithm_cfg, "train_timestep_range", None),
-        count=getattr(algorithm_cfg, "train_timestep_count", None),
-        timestep_fraction=algorithm_cfg.timestep_fraction,
-    )
-    latents = batch.batch["latents_clean"]
-    num_steps = train_timesteps.shape[1]
-    noise_rows = int(counts.size) if share_noise else len(latents)
-    noise = torch.randn(noise_rows, num_steps, *latents.shape[1:], dtype=torch.float32)
-    forward_noise = noise[group_index] if share_noise else noise
-
-    batch.batch["train_timesteps"] = train_timesteps
-    batch.batch["forward_noise"] = forward_noise
-    batch.batch["group_index"] = group_index
-    batch.batch["group_size"] = group_size
-    batch.batch["advantages"] = advantages[:, None].expand(-1, num_steps)
-    batch.batch["returns"] = batch.batch["advantages"]
-    batch.batch["sample_level_rewards"] = reward_tensor[:, None].expand(-1, num_steps)
-    return batch
+        batch.batch["train_timesteps"] = train_timesteps
+        batch.batch["forward_noise"] = forward_noise
+        batch.batch["group_index"] = group_index
+        batch.batch["group_size"] = group_size
+        batch.batch["advantages"] = advantages[:, None].expand(-1, num_steps)
+        batch.batch["returns"] = batch.batch["advantages"]
+        batch.batch["sample_level_rewards"] = reward_tensor[:, None].expand(-1, num_steps)
+        return batch
 
 
 @register_diffusion_loss("crd")
@@ -1758,12 +1745,57 @@ class CRDLoss(DiffusionLossFn):
     @staticmethod
     def validate_trainer_config(config: Any) -> None:
         """Require whole groups, independent adapters and the V1 synchronous LoRA path."""
-        if int(config.actor_rollout_ref.rollout.n) < 2:
-            raise ValueError("CRD requires rollout.n >= 2.")
-        _validate_group_forward_config(config, loss_name="CRD")
-        model = config.actor_rollout_ref.model
         actor = config.actor_rollout_ref.actor
+        model = config.actor_rollout_ref.model
+        rollout = config.actor_rollout_ref.rollout
+        n = int(rollout.n)
+        if n < 2:
+            raise ValueError("CRD requires rollout.n >= 2.")
+        micro = actor.get("ppo_micro_batch_size_per_gpu", None)
+        sp_size = OmegaConf.select(actor, "fsdp_config.ulysses_sequence_parallel_size", default=1) or 1
+        dp_size = int(config.trainer.n_gpus_per_node) * int(config.trainer.nnodes) // int(sp_size)
+        use_v1 = bool(OmegaConf.select(config, "trainer.use_v1", default=False))
+        update_prompts = int(config.data.train_batch_size)
+        if use_v1:
+            mode = OmegaConf.select(config, "trainer.v1.trainer_mode", default="sync")
+            update_prompts //= int(OmegaConf.select(config, f"trainer.v1.{mode}.parameter_sync_step", default=1) or 1)
         problems = []
+        if micro is None or int(micro) % n != 0:
+            problems.append(f"ppo_micro_batch_size_per_gpu={micro} must be a multiple of rollout.n={n}")
+        if int(actor.ppo_mini_batch_size) % dp_size != 0:
+            mini = actor.ppo_mini_batch_size
+            problems.append(f"ppo_mini_batch_size={mini} must be divisible by dp size {dp_size}")
+        if update_prompts % dp_size != 0:
+            problems.append(f"the {update_prompts} prompts per actor update must be divisible by dp size {dp_size}")
+        if actor.get("use_dynamic_bsz", False):
+            problems.append("use_dynamic_bsz must be False")
+        if not int(model.get("lora_rank", 0) or 0) > 0:
+            problems.append("actor_rollout_ref.model.lora_rank must be > 0 (CRD trains LoRA adapters)")
+        if "old" not in tuple(model.get("policy_state_adapters", ("default",))):
+            problems.append('actor_rollout_ref.model.policy_state_adapters must include "old"')
+        if rollout.get("rollout_adapter", None) != "old":
+            problems.append("actor_rollout_ref.rollout.rollout_adapter must be old")
+        if actor.get("use_kl_loss", False):
+            problems.append("actor_rollout_ref.actor.use_kl_loss must be False (use diffusion_loss.ref_kl_coef)")
+        if actor.get("enable_timestep_staging", False):
+            problems.append("actor_rollout_ref.actor.enable_timestep_staging must be False")
+        if use_v1 and not OmegaConf.select(config, "trainer.v1.sampler.drop_incomplete_groups", default=False):
+            problems.append("trainer.v1.sampler.drop_incomplete_groups must be True so groups arrive complete")
+        num_steps = OmegaConf.select(rollout, "pipeline.num_inference_steps", default=None)
+        timestep_range = OmegaConf.select(config, "algorithm.train_timestep_range", default=None)
+        count = OmegaConf.select(config, "algorithm.train_timestep_count", default=None)
+        if num_steps is not None:
+            num_steps = int(num_steps)
+            if timestep_range is None:
+                start, end = 0, num_steps
+            elif len(timestep_range) == 2:
+                start, end = int(timestep_range[0]), int(timestep_range[1])
+            else:
+                start, end = 0, 0
+            if not 0 <= start < end <= num_steps:
+                problems.append(f"train_timestep_range {timestep_range} must satisfy 0 <= start < end <= {num_steps}")
+            elif count is not None and not 1 <= int(count) <= end - start:
+                problems.append(f"train_timestep_count={count} must be between 1 and {end - start}, the range width")
         if (
             not OmegaConf.select(config, "trainer.use_v1", default=False)
             or OmegaConf.select(config, "trainer.v1.trainer_mode", default="sync") != "sync"
@@ -1792,7 +1824,52 @@ class CRDLoss(DiffusionLossFn):
     @staticmethod
     def prepare_actor_batch(batch: DataProto, reward_tensor: torch.Tensor, config: Any) -> DataProto:
         """Keep complete prompt groups and draw independent forward noise per sample."""
-        batch = _prepare_group_forward_batch(batch, reward_tensor, config, share_noise=False)
+        algorithm_cfg = config.algorithm
+        if "uid" not in batch.non_tensor_batch:
+            raise ValueError("CRD actor batch requires `uid` in non_tensor_batch.")
+        if "latents_clean" not in batch.batch.keys():
+            raise ValueError("CRD actor batch requires `latents_clean` from rollout.")
+        timestep_key = next((key for key in ("train_timesteps", "all_timesteps") if key in batch.batch.keys()), None)
+        if timestep_key is None:
+            raise ValueError("CRD actor batch requires `train_timesteps` or `all_timesteps` from rollout.")
+
+        # Micro batches are contiguous slices, so groups must be contiguous. Rollouts usually are already
+        # (prompts repeated n times in place); only then is the batch left in its original order.
+        group_index = DGPOLoss._first_appearance_index(batch.non_tensor_batch["uid"])
+        if np.any(np.diff(group_index) < 0):
+            order = np.argsort(group_index, kind="stable")
+            batch.reorder(torch.from_numpy(order))
+            reward_tensor = reward_tensor[torch.from_numpy(order).to(reward_tensor.device)]
+            group_index = group_index[order]
+
+        uid = batch.non_tensor_batch["uid"]
+        counts = np.bincount(group_index)
+        group_size = torch.from_numpy(counts[group_index]).long()
+        group_index = torch.from_numpy(group_index).long()
+
+        advantages = DiffusionNFTLoss._compute_group_advantages(
+            rewards=reward_tensor,
+            uid=uid,
+            norm_by_std=algorithm_cfg.norm_adv_by_std_in_grpo,
+            global_std=algorithm_cfg.global_std,
+        )
+        train_timesteps = DGPOLoss._select_shared_timesteps(
+            batch.batch[timestep_key],
+            timestep_range=getattr(algorithm_cfg, "train_timestep_range", None),
+            count=getattr(algorithm_cfg, "train_timestep_count", None),
+            timestep_fraction=algorithm_cfg.timestep_fraction,
+        )
+        latents = batch.batch["latents_clean"]
+        num_steps = train_timesteps.shape[1]
+        forward_noise = torch.randn(len(latents), num_steps, *latents.shape[1:], dtype=torch.float32)
+
+        batch.batch["train_timesteps"] = train_timesteps
+        batch.batch["forward_noise"] = forward_noise
+        batch.batch["group_index"] = group_index
+        batch.batch["group_size"] = group_size
+        batch.batch["advantages"] = advantages[:, None].expand(-1, num_steps)
+        batch.batch["returns"] = batch.batch["advantages"]
+        batch.batch["sample_level_rewards"] = reward_tensor[:, None].expand(-1, num_steps)
         expected = int(config.actor_rollout_ref.rollout.n)
         if (batch.batch["group_size"] != expected).any():
             raise ValueError("CRD actor batch must contain exactly rollout.n samples per prompt group.")

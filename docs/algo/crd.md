@@ -110,34 +110,6 @@ timestep staging. The initial scope is online V1 synchronous training with
 FSDP/FSDP2 LoRA. Checkpoints use the existing named-adapter and optimizer state;
 snapshot initialization precedes restoration so resumed EMA weights are kept.
 
-### Differences from the paper and reference implementation
-
-The numerical reference is the uniform-centering MSE branch in
-[`train_crd_sd3.py` at 19ed030](https://github.com/yuanzhi-zhu/CRD/blob/19ed030766c350bc0400c096941f7e18b5ca77a8/scripts/train_crd_sd3.py#L1084-L1236):
-`weight_temp < 0`, `use_CE=False`, `adaptive_logp=True`, `use_old_for_loss=True`.
-
-- Weighted centering and cross-entropy variants are not implemented.
-- Sampling EMA uses $\min(0.001s,0.5)$; moving-reference EMA uses
-  $\min(0.25+0.001s,0.5)$, following the released configuration. Here $s$ counts
-  trainer iterations; the reference counts optimizer steps. Each
-  `ppo_mini_batch_size` is one optimizer update, and both EMA states stay fixed
-  throughout an actor update. The paper's OCR schedules differ.
-- The recipe uses the paper's OCR anchor CFG 4.5 and maximum KL coefficient 0.1,
-  with the released code's KL floor of 0.0001. The released configuration uses
-  anchor CFG 1 and a maximum KL coefficient of 0.0001; the paper's equation has
-  a zero floor.
-- Rollout uses the supported Euler solver instead of DPM2. Four training
-  timesteps are drawn from the first seven rollout schedule entries and shared
-  across the batch. Noise is independent per sample and retained across PPO
-  epochs. The paper describes independent uniform times; the released loop uses
-  rollout times.
-- OCR uses Qwen2.5-VL transcription and normalized edit distance instead of
-  PaddleOCR. Advantage normalization uses current batch/group statistics instead
-  of historical prompt statistics.
-- The recipe uses six images per prompt, four prompts per actor GPU and a
-  learning rate of `1e-4`, rather than the paper's group size 24 and `3e-4` learning
-  rate. There is no additional evaluation-weight EMA.
-
 ## Configuration
 
 ```bash

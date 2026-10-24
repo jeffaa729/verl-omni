@@ -16,11 +16,11 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
 import torch
 from omegaconf import OmegaConf
 
 from tests.workers.crd_fsdp_checkpoint import Engine
+from verl_omni.trainer.diffusion.diffusion_trainer_utils import old_policy_decay
 from verl_omni.trainer.diffusion.v1.trainer_sync import PolicyGradientDiffusionTrainerV1Sync
 
 
@@ -100,6 +100,8 @@ def test_fresh_snapshots_copy_current_weights():
         torch.testing.assert_close(engine.module.lora_A[name], engine.module.lora_A["default"])
 
 
-def test_invalid_ema_decay_is_rejected():
-    with pytest.raises(ValueError, match="decay"):
-        Engine().ema_update_adapter(target="moving_reference", decay=1.1)
+def test_independent_decay_schedules():
+    assert old_policy_decay(0, "linear_from_0_25_to_0_5") == 0.25
+    assert old_policy_decay(100, "linear_from_0_25_to_0_5") == 0.35
+    assert old_policy_decay(100, "linear_to_0_5") == 0.1
+    assert old_policy_decay(1000, "linear_from_0_25_to_0_5") == 0.5

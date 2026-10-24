@@ -21,7 +21,6 @@ from tensordict import TensorDict
 from verl import DataProto
 
 from verl_omni.trainer.diffusion.diffusion_algos import CRDLoss, get_diffusion_loss_fn
-from verl_omni.trainer.diffusion.diffusion_trainer_utils import old_policy_decay
 from verl_omni.workers.config import DiffusionActorConfig, DiffusionLossConfig
 
 
@@ -175,13 +174,6 @@ def test_batch_preparation_reorders_rewards_and_uses_independent_noise():
     assert result.batch["forward_noise"].shape == (4, 2, 2, 3)
     assert not torch.equal(result.batch["forward_noise"][0], result.batch["forward_noise"][1])
     assert result.batch["group_size"].tolist() == [2] * 4
-
-
-def test_independent_decay_schedules():
-    assert old_policy_decay(0, "linear_from_0_25_to_0_5") == 0.25
-    assert old_policy_decay(100, "linear_from_0_25_to_0_5") == 0.35
-    assert old_policy_decay(100, "linear_to_0_5") == 0.1
-    assert old_policy_decay(1000, "linear_from_0_25_to_0_5") == 0.5
 
 
 @pytest.mark.parametrize(

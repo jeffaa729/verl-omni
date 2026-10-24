@@ -29,31 +29,12 @@ ROOT = Path(__file__).resolve().parents[3]
 
 
 @pytest.fixture
-def recipe_args(tmp_path):
-    stub = tmp_path / "python3"
-    stub.write_text('#!/bin/sh\nprintf "%s\\0" "$@" > "$CRD_ARGS_FILE"\nexit "${CRD_EXIT_CODE:-0}"\n')
-    stub.chmod(0o755)
-    captured = tmp_path / "args"
-    env = {
-        **os.environ,
-        "PATH": f"{tmp_path}:{os.environ['PATH']}",
-        "CRD_ARGS_FILE": str(captured),
-        "OCR_WORKSPACE": str(tmp_path / "workspace with spaces"),
-        "OUTPUT_DIR": str(tmp_path / "output with spaces"),
-        "NUM_GPUS_ACTOR_ROLLOUT": "1",
-        "NUM_GPUS_REWARD": "1",
-        "GROUP_SIZE": "2",
-    }
-
+def recipe_args(capture_launcher):
     def run(*overrides, code=0, comparison=False):
         recipe = "run_dgpo_comparison.sh" if comparison else "run_sd35_medium_ocr_lora_v1.sh"
-        result = subprocess.run(
-            ["bash", str(ROOT / "examples/crd_trainer/sd35" / recipe), *overrides],
-            env={**env, "CRD_EXIT_CODE": str(code)},
-            capture_output=True,
-            text=True,
-        )
-        return result, captured.read_bytes().decode().rstrip("\0").split("\0")
+        result, calls = capture_launcher(f"examples/crd_trainer/sd35/{recipe}", *overrides, exit_code=code)
+        assert len(calls) == 1
+        return result, calls[0]
 
     return run
 
@@ -155,16 +136,18 @@ def capture_launcher(tmp_path):
         "PATH": f"{tmp_path}:{os.environ['PATH']}",
         "CRD_CAPTURE": str(captured),
         "MODEL_PATH": str(tmp_path / "tiny model"),
-        "OUTPUT_DIR": str(tmp_path / "new output"),
-        "OCR_WORKSPACE": str(tmp_path / "data workspace"),
+        "OUTPUT_DIR": str(tmp_path / "output with spaces"),
+        "OCR_WORKSPACE": str(tmp_path / "workspace with spaces"),
         "NUM_GPUS": "2",
         "NUM_GPUS_ACTOR_ROLLOUT": "1",
         "NUM_GPUS_REWARD": "1",
+        "GROUP_SIZE": "2",
     }
 
-    def run(script, exit_code=0):
+    def run(script, *overrides, exit_code=0):
+        captured.write_text("")
         result = subprocess.run(
-            ["bash", str(ROOT / script)],
+            ["bash", str(ROOT / script), *overrides],
             env={**env, "CRD_TRAINER_EXIT": str(exit_code)},
             capture_output=True,
             text=True,
