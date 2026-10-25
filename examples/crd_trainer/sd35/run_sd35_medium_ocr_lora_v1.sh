@@ -22,7 +22,6 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 exec bash "$script_dir/../../dgpo_trainer/sd35/run_sd35_medium_ocr_lora_v1.sh" \
     actor_rollout_ref.model.algorithm=crd \
     actor_rollout_ref.model.policy_state_adapters='["default","old","moving_reference"]' \
-    actor_rollout_ref.model.pipeline.reference_guidance_scale=4.5 \
     actor_rollout_ref.actor.diffusion_loss.crd_beta=1.0 \
     actor_rollout_ref.actor.diffusion_loss.ref_kl_coef=0.1 \
     actor_rollout_ref.actor.diffusion_loss.crd_kl_min=0.0001 \

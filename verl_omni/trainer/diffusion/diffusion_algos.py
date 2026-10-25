@@ -1853,12 +1853,24 @@ class CRDLoss(DiffusionLossFn):
             norm_by_std=algorithm_cfg.norm_adv_by_std_in_grpo,
             global_std=algorithm_cfg.global_std,
         )
-        train_timesteps = DGPOLoss._select_shared_timesteps(
-            batch.batch[timestep_key],
-            timestep_range=getattr(algorithm_cfg, "train_timestep_range", None),
-            count=getattr(algorithm_cfg, "train_timestep_count", None),
-            timestep_fraction=algorithm_cfg.timestep_fraction,
-        )
+        schedule = batch.batch[timestep_key]
+        if not torch.equal(schedule, schedule[:1].expand_as(schedule)):
+            raise ValueError("CRD shares timesteps across the batch, so every rollout must use the same schedule.")
+        timestep_range = getattr(algorithm_cfg, "train_timestep_range", None)
+        count = getattr(algorithm_cfg, "train_timestep_count", None)
+        num_steps = schedule.shape[1]
+        start, end = (0, num_steps) if timestep_range is None else (int(timestep_range[0]), int(timestep_range[1]))
+        if not 0 <= start < end <= num_steps:
+            raise ValueError(f"train_timestep_range {timestep_range} must satisfy 0 <= start < end <= {num_steps}.")
+        width = end - start
+        if count is not None and not 1 <= int(count) <= width:
+            raise ValueError(f"train_timestep_count={count} must be between 1 and {width}, the range width.")
+        count = max(1, int(width * algorithm_cfg.timestep_fraction)) if count is None else int(count)
+        index = torch.randperm(width)[:count] + start
+        selected = schedule[:, index.to(schedule.device)]
+        if (selected < 0).any():
+            raise ValueError("CRD training timesteps must be >= 0.")
+        train_timesteps = selected.long()
         latents = batch.batch["latents_clean"]
         num_steps = train_timesteps.shape[1]
         forward_noise = torch.randn(len(latents), num_steps, *latents.shape[1:], dtype=torch.float32)

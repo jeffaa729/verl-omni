@@ -45,7 +45,7 @@ def test_training_target_uses_exact_noise_and_stops_gradient():
     clean = torch.randn(2, 2, 3, requires_grad=True)
     noise = torch.randn(2, 1, 2, 3, requires_grad=True)
     batch = TensorDict(
-        {"latents_clean": clean, "forward_noise": noise, "train_timesteps": torch.tensor([[1], [999]])}, [2]
+        {"latents_clean": clean, "forward_noise": noise, "train_timesteps": torch.tensor([[0], [999]])}, [2]
     )
     scheduler = SimpleNamespace(config=SimpleNamespace(num_train_timesteps=1000))
     latents, times, context = StableDiffusion3CRD.prepare_training_inputs(batch, 0, scheduler)

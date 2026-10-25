@@ -153,7 +153,7 @@ def test_reward_adaptive_kl_endpoints():
 
 def test_batch_preparation_reorders_rewards_and_uses_independent_noise():
     batch = DataProto.from_dict(
-        tensors={"latents_clean": torch.zeros(4, 2, 3), "all_timesteps": torch.tensor([[900, 600, 300]] * 4)},
+        tensors={"latents_clean": torch.zeros(4, 2, 3), "all_timesteps": torch.tensor([[900, 0]] * 4)},
         non_tensors={"uid": np.array(["a", "b", "a", "b"])},
     )
     config = OmegaConf.create(
@@ -171,6 +171,7 @@ def test_batch_preparation_reorders_rewards_and_uses_independent_noise():
     result = CRDLoss.prepare_actor_batch(batch, torch.tensor([0.1, 0.2, 0.9, 0.8]), config)
     assert result.non_tensor_batch["uid"].tolist() == ["a", "a", "b", "b"]
     torch.testing.assert_close(result.batch["raw_rewards"], torch.tensor([0.1, 0.9, 0.2, 0.8]))
+    assert result.batch["train_timesteps"].sort(dim=1).values.tolist() == [[0, 900]] * 4
     assert result.batch["forward_noise"].shape == (4, 2, 2, 3)
     assert not torch.equal(result.batch["forward_noise"][0], result.batch["forward_noise"][1])
     assert result.batch["group_size"].tolist() == [2] * 4

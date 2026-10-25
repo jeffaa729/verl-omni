@@ -1,6 +1,6 @@
 # CRD Trainer
 
-Last updated: 10/24/2026.
+Last updated: 10/25/2026.
 
 This example post-trains `stabilityai/stable-diffusion-3.5-medium` with
 [CRD](../../docs/algo/crd.md) on OCR, using LoRA, the V1 synchronous trainer,
@@ -67,18 +67,17 @@ CRD's training settings with DGPO's loss and sampling EMA schedule.
 - Python 3.12, PyTorch `2.13.0+cu130`, vLLM `0.30.0`, repository-pinned
   vLLM-Omni and verl, diffusers `0.40.0`, native/SDPA attention.
 
-Both runs completed 100 iterations (400 optimizer updates) at 512×512 with four
-prompts and six images per prompt, using one training seed. Evaluation used 128
-fixed held-out prompts, one image per prompt and seed 42 at iterations 0, 10, …, 100.
-For this evaluation setup, append `data.val_max_samples=128
-data.validation_shuffle=False data.val_batch_size=1` to either command.
+CRD and the matched DGPO comparison each completed 100 training iterations and
+400 optimizer updates at 512×512, using four prompts and six images per prompt.
+Both runs evaluated the same 128 fixed held-out prompts before training and every
+10 iterations, with identical generation seeds and settings.
 
 | Metric | CRD | DGPO |
 | --- | --- | --- |
 | Initial held-out OCR reward | 0.7671 | 0.7671 |
-| Final held-out OCR reward | 0.8312 | 0.8208 |
-| Best observed held-out OCR reward | 0.8754 (iteration 30) | 0.8400 (iteration 90) |
-| Mean training iteration, excluding evaluation | 51.6 s | 35.3 s |
-| Training images per second, excluding evaluation | 0.465 | 0.679 |
-| Sampled actor/rollout GPU memory peak | 28.1 GiB | 50.3 GiB |
+| Final held-out OCR reward | 0.9267 | 0.8208 |
+| Best observed held-out OCR reward | 0.9601 (iteration 90) | 0.8400 (iteration 90) |
+| Mean training iteration, excluding evaluation | 37.2 s | 35.3 s |
+| Training images per second, excluding evaluation | 0.646 | 0.679 |
+| Sampled actor/rollout GPU memory peak | 50.4 GiB | 50.3 GiB |
 | Sampled reward GPU memory peak | 57.1 GiB | 57.1 GiB |

@@ -1,6 +1,6 @@
 # Config Explanation
 
-Last updated: 10/10/2026
+Last updated: 10/25/2026
 
 VeRL-Omni builds on [verl](https://github.com/verl-project/verl) and reuses the
 same Hydra config surface for shared RL trainer fields (`data`, FSDP actor /
@@ -69,10 +69,10 @@ algorithm:
 - `algorithm.global_std`: Use a global (cross-group) std for advantage normalization.
 - `algorithm.old_policy_decay_schedule`: DiffusionNFT/DGPO/CRD sampling-policy EMA schedule. One of `copy`, `linear_to_0_5`, `linear_to_0_3`, `linear_from_0_25_to_0_5`, `delayed_linear_to_0_999`.
 - `algorithm.old_policy_decay`: Fixed old-policy EMA decay in `[0, 1]`. When set, overrides `old_policy_decay_schedule`.
-- `algorithm.old_policy_update_interval`: Trainer updates between sampling-policy adapter refreshes (must be `> 0`).
+- `algorithm.old_policy_update_interval`: Trainer iterations between sampling-policy adapter refreshes (must be `> 0`).
 - `algorithm.reference_policy_decay_schedule`: Independent EMA schedule for CRD's `moving_reference` adapter (default `linear_from_0_25_to_0_5`).
 - `algorithm.reference_policy_decay`: Optional fixed moving-reference decay in `[0, 1]`.
-- `algorithm.reference_policy_update_interval`: Trainer updates between moving-reference refreshes.
+- `algorithm.reference_policy_update_interval`: Trainer iterations between moving-reference refreshes.
 - `algorithm.timestep_fraction`: Fraction of rollout timesteps used for forward-process training, in `(0, 1]`.
 - `algorithm.train_timestep_range`: DGPO/CRD. Rollout schedule indices `[start, end)` that training timesteps are drawn from; `null` uses the whole schedule.
 - `algorithm.train_timestep_count`: DGPO/CRD. Number of schedule indices drawn per step and shared by the batch; `null` applies `timestep_fraction`.
