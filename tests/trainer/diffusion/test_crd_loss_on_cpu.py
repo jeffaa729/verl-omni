@@ -49,7 +49,7 @@ def actor(**kwargs):
 
 
 def reference(values, cfg):
-    """Independent loop transcription of the released uniform-centering branch."""
+    """Loop reference for the within-prompt CRD objective."""
     scores = []
     for current, old, target in zip(
         values["forward_prediction"], values["old_prediction"], values["velocity_target"], strict=False
@@ -82,6 +82,28 @@ def test_loss_and_gradient_match_reference(beta):
     (grad,) = torch.autograd.grad(actual, values["forward_prediction"], retain_graph=True)
     (expected_grad,) = torch.autograd.grad(expected, values["forward_prediction"])
     torch.testing.assert_close(grad, expected_grad)
+
+
+def test_hand_computed_loss_and_gradient():
+    prediction = torch.tensor([[1.0], [3.0]], requires_grad=True)
+    loss, metrics = CRDLoss.compute_loss(
+        forward_prediction=prediction,
+        old_prediction=torch.tensor([[2.0], [2.0]]),
+        ref_forward_prediction=torch.zeros(2, 1),
+        velocity_target=torch.zeros(2, 1),
+        advantages=torch.tensor([-1.0, 1.0]),
+        raw_rewards=torch.tensor([0.0, 1.0]),
+        group_index=torch.tensor([0, 0]),
+        group_size=torch.tensor([2, 2]),
+        config=actor(crd_beta=1.0, adv_clip_max=1.0, crd_kl_min=0.1, ref_kl_coef=0.3),
+    )
+    # Implicit rewards [1, -1], centered rewards [-0.5, 0.5]: residuals [1.5, -1.5].
+    assert metrics["actor/crd_policy_loss"] == pytest.approx(2.25)
+    assert metrics["actor/crd_kl_loss"] == pytest.approx(1.4)  # (0.1 * 1 + 0.3 * 9) / 2
+    assert loss.item() == pytest.approx(3.65)
+    loss.backward()
+    # Detached denominators and centering give policy gradients [-3, 3], plus KL [0.1, 0.9].
+    torch.testing.assert_close(prediction.grad, torch.tensor([[-2.9], [3.9]]))
 
 
 def test_registry_and_stop_gradients():
@@ -151,9 +173,10 @@ def test_reward_adaptive_kl_endpoints():
         assert metrics["actor/crd_kl_coefficient"] == pytest.approx(coefficient)
 
 
-def test_batch_preparation_reorders_rewards_and_uses_independent_noise():
+@pytest.mark.parametrize("schedule", [[900, 0], [900.5, 0.5]])
+def test_batch_preparation_reorders_rewards_and_uses_independent_noise(schedule):
     batch = DataProto.from_dict(
-        tensors={"latents_clean": torch.zeros(4, 2, 3), "all_timesteps": torch.tensor([[900, 0]] * 4)},
+        tensors={"latents_clean": torch.zeros(4, 2, 3), "all_timesteps": torch.tensor([schedule] * 4)},
         non_tensors={"uid": np.array(["a", "b", "a", "b"])},
     )
     config = OmegaConf.create(
@@ -171,7 +194,7 @@ def test_batch_preparation_reorders_rewards_and_uses_independent_noise():
     result = CRDLoss.prepare_actor_batch(batch, torch.tensor([0.1, 0.2, 0.9, 0.8]), config)
     assert result.non_tensor_batch["uid"].tolist() == ["a", "a", "b", "b"]
     torch.testing.assert_close(result.batch["raw_rewards"], torch.tensor([0.1, 0.9, 0.2, 0.8]))
-    assert result.batch["train_timesteps"].sort(dim=1).values.tolist() == [[0, 900]] * 4
+    torch.testing.assert_close(result.batch["train_timesteps"].sort(dim=1).values, torch.tensor([sorted(schedule)] * 4))
     assert result.batch["forward_noise"].shape == (4, 2, 2, 3)
     assert not torch.equal(result.batch["forward_noise"][0], result.batch["forward_noise"][1])
     assert result.batch["group_size"].tolist() == [2] * 4

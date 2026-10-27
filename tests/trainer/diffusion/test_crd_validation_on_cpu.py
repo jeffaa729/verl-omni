@@ -13,10 +13,12 @@
 # limitations under the License.
 """Fault injection for CRD GPU evidence checks, without launching a GPU job."""
 
+import sys
+
 import pytest
 import torch
 
-from tests.special_e2e.check_crd_run import check_run
+from tests.special_e2e.check_crd_run import check_run, main
 from tests.special_e2e.crd_smoke_reward import compute_score
 
 
@@ -33,8 +35,11 @@ def evidence(tmp_path):
     return log, tmp_path
 
 
-def test_complete_run_evidence(evidence):
-    check_run(*evidence, [3])
+def test_complete_run_evidence(evidence, monkeypatch, capsys):
+    log, root = evidence
+    monkeypatch.setattr(sys, "argv", ["check_crd_run", "--log", str(log), "--output-dir", str(root), "--steps", "3"])
+    main()
+    assert capsys.readouterr().out == "CRD finite metrics and complete checkpoints verified for steps [3].\n"
 
 
 @pytest.mark.parametrize("value", ["nan", "inf", "-inf"])

@@ -120,7 +120,7 @@ def test_real_sd3_peft_gradients_match_with_gradient_checkpointing():
     from peft import LoraConfig
     from verl.utils import tensordict_utils as tu
 
-    from tests.workers.crd_fsdp_checkpoint import make_batch
+    from tests.workers.crd_fsdp_checkpoint import make_batch, make_reference_engine
 
     results = []
     for checkpointing in (False, True):
@@ -169,3 +169,30 @@ def test_real_sd3_peft_gradients_match_with_gradient_checkpointing():
         assert any(grad.abs().sum() > 0 for grad in gradients.values())
         results.append((loss.detach(), gradients))
     torch.testing.assert_close(results[0], results[1], rtol=0, atol=0)
+
+    from verl.workers.config import FSDPOptimizerConfig
+
+    engine.model_config.attn_backend = "native"
+    engine.optimizer_config = FSDPOptimizerConfig(lr=1e-4, total_training_steps=4)
+    reference = make_reference_engine(engine, "cpu")
+    engine.module.zero_grad(set_to_none=True)
+    rank_batches = [make_batch(engine.model_config, "cpu", rank=rank) for rank in range(2)]
+    assert not torch.equal(rank_batches[0]["latents_clean"], rank_batches[1]["latents_clean"])
+    assert rank_batches[0]["group_index"].tolist() == [0, 0]
+    assert rank_batches[1]["group_index"].tolist() == [1, 1]
+    global_batch = torch.cat(rank_batches)
+    tu.assign_non_tensor(global_batch, gradient_accumulation_steps=1, sp_size=1)
+    loss_function = partial(diffusion_loss, config=actor)
+    global_loss, _ = reference.forward_step(global_batch, loss_function, False, 0)
+    global_loss.backward()
+    for batch in rank_batches:
+        tu.assign_non_tensor(batch, gradient_accumulation_steps=2, sp_size=1)
+        local_loss, _ = engine.forward_step(batch, loss_function, False, 0)
+        local_loss.backward()
+    gradients = {
+        name: parameter.grad for name, parameter in engine.module.named_parameters() if parameter.grad is not None
+    }
+    expected = {
+        name: parameter.grad for name, parameter in reference.module.named_parameters() if parameter.grad is not None
+    }
+    torch.testing.assert_close(gradients, expected, rtol=1e-4, atol=1e-6)

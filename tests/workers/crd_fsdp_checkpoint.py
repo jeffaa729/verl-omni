@@ -136,10 +136,10 @@ def exercise_checkpoint(engine, batch, actor, checkpoint_dir):
     assert_same_state(snapshot(engine), uninterrupted)
 
 
-def make_batch(model_config, device):
-    """Two complete samples for one prompt, with independent noise and explicit negative conditioning."""
+def make_batch(model_config, device, rank=0):
+    """One complete prompt group with rank-specific inputs and independent forward noise."""
     cfg = model_config.transformer_config
-    generator = torch.Generator().manual_seed(7)
+    generator = torch.Generator().manual_seed(7 + rank)
 
     def rand(*shape):
         return torch.randn(*shape, generator=generator).to(device)
@@ -157,7 +157,7 @@ def make_batch(model_config, device):
             "negative_pooled_prompt_embeds": rand(2, cfg["pooled_projection_dim"]),
             "advantages": torch.tensor([[-1.0], [1.0]], device=device),
             "raw_rewards": torch.tensor([0.2, 0.8], device=device),
-            "group_index": torch.zeros(2, dtype=torch.long, device=device),
+            "group_index": torch.full((2,), rank, dtype=torch.long, device=device),
             "group_size": torch.full((2,), 2, device=device),
         },
         [2],
@@ -166,6 +166,75 @@ def make_batch(model_config, device):
 
     tu.assign_non_tensor(batch, micro_batch_size_per_gpu=2, use_dynamic_bsz=False)
     return batch
+
+
+def make_reference_engine(engine, device):
+    """Build an unsharded SD3 reference with the exact distributed model and adapter weights."""
+    from diffusers import SD3Transformer2DModel
+
+    reference = object.__new__(NFTDiffusersFSDPEngine)
+    reference.rank = 0
+    reference.module = SD3Transformer2DModel.from_config(engine.model_config.transformer_config).to(device)
+    reference.module.set_attention_backend(engine.model_config.attn_backend)
+    for name, config in engine.module.peft_config.items():
+        reference.module.add_adapter(copy.deepcopy(config), adapter_name=name)
+    state = {
+        name: value.full_tensor() if isinstance(value, DTensor) else value
+        for name, value in engine.module.state_dict().items()
+    }
+    reference.module.load_state_dict(state)
+    reference.module.set_adapter("default")
+    reference.module.train()
+    reference.model_config = engine.model_config
+    reference.scheduler = engine.scheduler
+    reference.use_ulysses_sp = False
+    reference.get_data_parallel_group = lambda: None
+    reference.optimizer_config = engine.optimizer_config
+    reference.optimizer = reference._build_optimizer(reference.module)
+    reference.lr_scheduler = reference._build_lr_scheduler(reference.optimizer)
+    return reference
+
+
+def assert_distributed_update(engine, actor, device):
+    """Compare rank-distinct FSDP2 gradients and an optimizer update with one global-batch forward."""
+    from verl.utils import tensordict_utils as tu
+
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+    reference = make_reference_engine(engine, device)
+    global_batch = torch.cat([make_batch(engine.model_config, device, rank=r) for r in range(world_size)])
+    tu.assign_non_tensor(global_batch, gradient_accumulation_steps=1, sp_size=1)
+    reference.optimizer_zero_grad()
+    loss_function = partial(diffusion_loss, config=actor)
+    loss, _ = reference.forward_step(global_batch, loss_function, forward_only=False, step=0)
+    loss.backward()
+    expected_gradients = {
+        name: parameter.grad.detach().clone()
+        for name, parameter in reference.module.named_parameters()
+        if parameter.grad is not None
+    }
+    assert expected_gradients and all(".default." in name for name in expected_gradients)
+    expected_norm = reference.optimizer_step()
+    reference.lr_scheduler_step()
+
+    with engine.train_mode():
+        engine.optimizer_zero_grad()
+        engine.forward_backward_batch(make_batch(engine.model_config, device, rank=rank), loss_function)
+        gradients = {}
+        for name, parameter in engine.module.named_parameters():
+            if parameter.grad is not None:
+                gradients[name] = (
+                    parameter.grad.full_tensor() if isinstance(parameter.grad, DTensor) else parameter.grad
+                )
+        torch.testing.assert_close(gradients, expected_gradients, rtol=1e-4, atol=1e-6)
+        norm = engine.optimizer_step()
+        engine.lr_scheduler_step()
+        assert math.isfinite(norm) and norm > 0
+        torch.testing.assert_close(norm, expected_norm, rtol=1e-4, atol=1e-6)
+        expected_parameters = dict(reference.module.named_parameters())
+        for name, parameter in engine.module.named_parameters():
+            actual = parameter.full_tensor() if isinstance(parameter, DTensor) else parameter
+            torch.testing.assert_close(actual, expected_parameters[name], rtol=1e-4, atol=1e-6)
 
 
 def main():
@@ -200,10 +269,15 @@ def main():
         actor = DiffusionActorConfig(
             strategy="fsdp2", rollout_n=2, diffusion_loss=DiffusionLossConfig(loss_mode="crd", ref_kl_coef=0.1)
         )
-        batch = make_batch(model, torch.device("cuda", int(os.environ["LOCAL_RANK"])))
+        device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+        assert_distributed_update(engine, actor, device)
+        batch = make_batch(model, device, rank=torch.distributed.get_rank())
         exercise_checkpoint(engine, batch, actor, args.checkpoint_dir)
         if torch.distributed.get_rank() == 0:
-            print("CRD FSDP2: weight update, frozen states, independent EMA and exact save/resume passed.")
+            print(
+                "CRD FSDP2: global-batch gradient/update parity, frozen states, "
+                "independent EMA and exact save/resume passed."
+            )
     finally:
         torch.distributed.destroy_process_group()
 

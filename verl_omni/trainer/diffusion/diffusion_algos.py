@@ -1583,18 +1583,34 @@ class DGPOLoss(DiffusionLossFn):
         return rank[inverse.reshape(-1)]
 
     @staticmethod
+    def _make_groups_contiguous(batch: DataProto, reward_tensor: torch.Tensor) -> tuple[torch.Tensor, np.ndarray]:
+        """Keep prompt groups whole in contiguous micro batches, preserving reward alignment."""
+        group_index = DGPOLoss._first_appearance_index(batch.non_tensor_batch["uid"])
+        if np.any(np.diff(group_index) < 0):
+            order = np.argsort(group_index, kind="stable")
+            batch.reorder(torch.from_numpy(order))
+            reward_tensor = reward_tensor[torch.from_numpy(order).to(reward_tensor.device)]
+            group_index = group_index[order]
+        return reward_tensor, group_index
+
+    @staticmethod
     def _select_shared_timesteps(
         schedule: torch.Tensor,
         timestep_range: Optional[list[int]],
         count: Optional[int],
         timestep_fraction: float,
         generator: Optional[torch.Generator] = None,
+        *,
+        min_timestep: int = 1,
+        loss_name: str = "DGPO",
     ) -> torch.Tensor:
         """Draw schedule indices once and apply them to every row, so groups share timesteps."""
         if schedule.ndim != 2:
-            raise ValueError(f"DGPO rollout timesteps must have shape [B, T], got {tuple(schedule.shape)}.")
+            raise ValueError(f"{loss_name} rollout timesteps must have shape [B, T], got {tuple(schedule.shape)}.")
         if not torch.equal(schedule, schedule[:1].expand_as(schedule)):
-            raise ValueError("DGPO shares timesteps across the batch, so every rollout must use the same schedule.")
+            raise ValueError(
+                f"{loss_name} shares timesteps across the batch, so every rollout must use the same schedule."
+            )
         num_steps = schedule.shape[1]
         start, end = (0, num_steps) if timestep_range is None else (int(timestep_range[0]), int(timestep_range[1]))
         if not 0 <= start < end <= num_steps:
@@ -1604,10 +1620,13 @@ class DGPOLoss(DiffusionLossFn):
             raise ValueError(f"train_timestep_count={count} must be between 1 and {width}, the range width.")
         count = max(1, int(width * timestep_fraction)) if count is None else int(count)
         index = torch.randperm(width, generator=generator)[:count] + start
-        selected = schedule[:, index.to(schedule.device)].long()
-        # The engine recovers the velocity target as (x_t - x_0) / t, so t must stay positive after flooring.
-        if (selected < 1).any():
-            raise ValueError("DGPO training timesteps must be >= 1; narrow train_timestep_range to skip the last step.")
+        selected = schedule[:, index.to(schedule.device)]
+        # DGPO divides by t; CRD constructs the velocity target directly and allows t=0.
+        if (selected < min_timestep).any():
+            raise ValueError(
+                f"{loss_name} training timesteps must be >= {min_timestep}; "
+                "narrow train_timestep_range to skip the last step."
+            )
         return selected
 
     @staticmethod
@@ -1626,14 +1645,7 @@ class DGPOLoss(DiffusionLossFn):
         if timestep_key is None:
             raise ValueError("DGPO actor batch requires `train_timesteps` or `all_timesteps` from rollout.")
 
-        # Micro batches are contiguous slices, so groups must be contiguous. Rollouts usually are already
-        # (prompts repeated n times in place); only then is the batch left in its original order.
-        group_index = DGPOLoss._first_appearance_index(batch.non_tensor_batch["uid"])
-        if np.any(np.diff(group_index) < 0):
-            order = np.argsort(group_index, kind="stable")
-            batch.reorder(torch.from_numpy(order))
-            reward_tensor = reward_tensor[torch.from_numpy(order).to(reward_tensor.device)]
-            group_index = group_index[order]
+        reward_tensor, group_index = DGPOLoss._make_groups_contiguous(batch, reward_tensor)
 
         uid = batch.non_tensor_batch["uid"]
         counts = np.bincount(group_index)
@@ -1651,7 +1663,7 @@ class DGPOLoss(DiffusionLossFn):
             timestep_range=getattr(algorithm_cfg, "train_timestep_range", None),
             count=getattr(algorithm_cfg, "train_timestep_count", None),
             timestep_fraction=algorithm_cfg.timestep_fraction,
-        )
+        ).long()
         latents = batch.batch["latents_clean"]
         num_steps = train_timesteps.shape[1]
         group_noise = torch.randn(int(counts.size), num_steps, *latents.shape[1:], dtype=torch.float32)
@@ -1671,9 +1683,9 @@ class DGPOLoss(DiffusionLossFn):
 class CRDLoss(DiffusionLossFn):
     """Centered Reward Distillation (Zhu et al., arXiv:2603.14128).
 
-    Implements the released uniform-centering, adaptive-logp MSE branch of
-    yuanzhi-zhu/CRD at 19ed030. Each prompt group must fit in one micro batch.
-    The sampling adapter is independent of the moving loss reference.
+    Centers rewards within prompt groups rather than the reference code's gathered
+    batch. The recipe uses CFG=1 sampling and a CFG=4.5 pretrained anchor; the
+    reference recipe uses guided sampling and an unguided anchor.
     """
 
     uses_old_adapter = True
@@ -1815,7 +1827,7 @@ class CRDLoss(DiffusionLossFn):
             problems.append("CRD supports adv_mode=continuous")
         if actor.strategy not in ("fsdp", "fsdp2"):
             problems.append("CRD requires fsdp or fsdp2")
-        scale = float(model.pipeline.get("reference_guidance_scale", 4.5))
+        scale = float(model.pipeline.reference_guidance_scale)
         if not np.isfinite(scale) or scale < 1:
             problems.append("reference_guidance_scale must be finite and >= 1")
         if problems:
@@ -1833,14 +1845,7 @@ class CRDLoss(DiffusionLossFn):
         if timestep_key is None:
             raise ValueError("CRD actor batch requires `train_timesteps` or `all_timesteps` from rollout.")
 
-        # Micro batches are contiguous slices, so groups must be contiguous. Rollouts usually are already
-        # (prompts repeated n times in place); only then is the batch left in its original order.
-        group_index = DGPOLoss._first_appearance_index(batch.non_tensor_batch["uid"])
-        if np.any(np.diff(group_index) < 0):
-            order = np.argsort(group_index, kind="stable")
-            batch.reorder(torch.from_numpy(order))
-            reward_tensor = reward_tensor[torch.from_numpy(order).to(reward_tensor.device)]
-            group_index = group_index[order]
+        reward_tensor, group_index = DGPOLoss._make_groups_contiguous(batch, reward_tensor)
 
         uid = batch.non_tensor_batch["uid"]
         counts = np.bincount(group_index)
@@ -1853,24 +1858,14 @@ class CRDLoss(DiffusionLossFn):
             norm_by_std=algorithm_cfg.norm_adv_by_std_in_grpo,
             global_std=algorithm_cfg.global_std,
         )
-        schedule = batch.batch[timestep_key]
-        if not torch.equal(schedule, schedule[:1].expand_as(schedule)):
-            raise ValueError("CRD shares timesteps across the batch, so every rollout must use the same schedule.")
-        timestep_range = getattr(algorithm_cfg, "train_timestep_range", None)
-        count = getattr(algorithm_cfg, "train_timestep_count", None)
-        num_steps = schedule.shape[1]
-        start, end = (0, num_steps) if timestep_range is None else (int(timestep_range[0]), int(timestep_range[1]))
-        if not 0 <= start < end <= num_steps:
-            raise ValueError(f"train_timestep_range {timestep_range} must satisfy 0 <= start < end <= {num_steps}.")
-        width = end - start
-        if count is not None and not 1 <= int(count) <= width:
-            raise ValueError(f"train_timestep_count={count} must be between 1 and {width}, the range width.")
-        count = max(1, int(width * algorithm_cfg.timestep_fraction)) if count is None else int(count)
-        index = torch.randperm(width)[:count] + start
-        selected = schedule[:, index.to(schedule.device)]
-        if (selected < 0).any():
-            raise ValueError("CRD training timesteps must be >= 0.")
-        train_timesteps = selected.long()
+        train_timesteps = DGPOLoss._select_shared_timesteps(
+            batch.batch[timestep_key],
+            timestep_range=getattr(algorithm_cfg, "train_timestep_range", None),
+            count=getattr(algorithm_cfg, "train_timestep_count", None),
+            timestep_fraction=algorithm_cfg.timestep_fraction,
+            min_timestep=0,
+            loss_name="CRD",
+        )
         latents = batch.batch["latents_clean"]
         num_steps = train_timesteps.shape[1]
         forward_noise = torch.randn(len(latents), num_steps, *latents.shape[1:], dtype=torch.float32)

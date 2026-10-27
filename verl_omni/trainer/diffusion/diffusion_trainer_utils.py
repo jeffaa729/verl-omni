@@ -38,11 +38,11 @@ def _to_diffusion_worker_tensordict(batch: DataProto):
 
 
 OLD_POLICY_DECAY_SCHEDULES = {
-    "copy": (0, 0.0, 0.0),
-    "linear_to_0_3": (0, 0.001, 0.3),
-    "linear_to_0_5": (0, 0.001, 0.5),
-    "linear_from_0_25_to_0_5": (0, 0.001, 0.5),
-    "delayed_linear_to_0_999": (75, 0.0075, 0.999),
+    "copy": (0, 0.0, 0.0, 0.0),
+    "linear_to_0_3": (0, 0.0, 0.001, 0.3),
+    "linear_to_0_5": (0, 0.0, 0.001, 0.5),
+    "linear_from_0_25_to_0_5": (0, 0.25, 0.001, 0.5),
+    "delayed_linear_to_0_999": (75, 0.0, 0.0075, 0.999),
 }
 
 
@@ -57,10 +57,9 @@ def old_policy_decay(step: int, schedule: str) -> float:
     CRD's ``linear_from_0_25_to_0_5`` starts at 0.25 and ramps by 0.001 per step.
     """
     if schedule in OLD_POLICY_DECAY_SCHEDULES:
-        warmup_steps, ramp_rate, max_decay = OLD_POLICY_DECAY_SCHEDULES[schedule]
+        warmup_steps, initial_decay, ramp_rate, max_decay = OLD_POLICY_DECAY_SCHEDULES[schedule]
     else:
         raise ValueError(f"Unsupported old_policy_decay_schedule: {schedule}")
-    initial_decay = 0.25 if schedule == "linear_from_0_25_to_0_5" else 0.0
     return 0.0 if step < warmup_steps else min(initial_decay + (step - warmup_steps) * ramp_rate, max_decay)
 
 
