@@ -105,6 +105,9 @@ trained and reference policies.
 
 ## CRD
 
+`old_policy/*` reports sampling-adapter refreshes; `reference_policy/*` reports moving-reference
+refreshes. Each includes `update_applied`, `copy_update`, `ema_update`, and `decay` for that iteration.
+
 CRD matches within-prompt centered rewards to implicit rewards estimated from denoising
 errors. With $d_i^\theta$ and $d_i^{\mathrm{moving}}$ the adaptive-normalized denoising errors
 of the trained policy and moving reference, the implicit reward is

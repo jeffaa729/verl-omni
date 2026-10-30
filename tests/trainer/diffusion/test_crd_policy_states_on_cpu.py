@@ -20,6 +20,7 @@ import torch
 from omegaconf import OmegaConf
 
 from tests.workers.crd_fsdp_checkpoint import Engine
+from verl_omni.trainer.diffusion.diffusion_algos import get_diffusion_loss_fn
 from verl_omni.trainer.diffusion.diffusion_trainer_utils import old_policy_decay
 from verl_omni.trainer.diffusion.v1.trainer_sync import PolicyGradientDiffusionTrainerV1Sync
 
@@ -28,6 +29,7 @@ def make_trainer(engine):
     trainer = object.__new__(PolicyGradientDiffusionTrainerV1Sync)
     trainer.actor_rollout_wg = engine
     trainer._has_old_adapter = True
+    trainer._loss_fn = get_diffusion_loss_fn("crd")
     trainer.config = OmegaConf.create(
         {
             "actor_rollout_ref": {
@@ -50,11 +52,13 @@ def test_ema_snapshots_are_independent_and_restore_trainability():
     engine = Engine()
     trainer = make_trainer(engine)
     trainer.global_steps = 1
-    trainer._update_old_policy()
+    metrics = trainer._update_policy_adapters()
+    assert metrics["old_policy/update_applied"] == 0
+    assert metrics["reference_policy/update_applied"] == 1
     torch.testing.assert_close(engine.module.lora_A["old"], torch.tensor([0.0]))
     torch.testing.assert_close(engine.module.lora_A["moving_reference"], torch.tensor([2.5]))
     trainer.global_steps = 2
-    trainer._update_old_policy()
+    trainer._update_policy_adapters()
     torch.testing.assert_close(engine.module.lora_A["old"], torch.tensor([2.0]))
     torch.testing.assert_close(engine.module.lora_A["moving_reference"], torch.tensor([2.875]))
     assert engine.module.active_adapter == "default"
@@ -65,7 +69,7 @@ def test_serialized_snapshots_resume_without_reinitialization(tmp_path):
     engine = Engine()
     trainer = make_trainer(engine)
     trainer.global_steps = 2
-    trainer._update_old_policy()
+    trainer._update_policy_adapters()
     saved = {k: v.clone() for k, v in engine.module.state_dict().items()}
     path = tmp_path / "model.pt"
     torch.save(saved, path)
@@ -98,6 +102,18 @@ def test_fresh_snapshots_copy_current_weights():
     make_trainer(engine)._initialize_policy_adapters()
     for name in ("old", "moving_reference"):
         torch.testing.assert_close(engine.module.lora_A[name], engine.module.lora_A["default"])
+    trainer = make_trainer(MagicMock())
+    trainer._loss_fn = SimpleNamespace(extra_ema_adapters=(("other_reference", "reference_policy"),))
+    trainer._initialize_policy_adapters()
+    assert [call.kwargs["target"] for call in trainer.actor_rollout_wg.copy_adapter.call_args_list] == [
+        "other_reference",
+        "old",
+    ]
+    trainer.global_steps = 1
+    assert trainer._update_policy_adapters()["reference_policy/update_applied"] == 1
+    trainer.actor_rollout_wg.ema_update_adapter.assert_called_once_with(
+        source="default", target="other_reference", decay=0.75
+    )
 
 
 def test_independent_decay_schedules():

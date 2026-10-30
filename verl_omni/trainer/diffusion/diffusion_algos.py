@@ -62,6 +62,8 @@ class DiffusionLossFn(ABC):
     required_data_keys: tuple[str, ...] = ()
     # Whether the loss trains against the LoRA ``old`` adapter that the rollout samples with.
     uses_old_adapter: bool = False
+    # Extra EMA snapshots: (adapter name, algorithm config prefix).
+    extra_ema_adapters: tuple[tuple[str, str], ...] = ()
     # Whether the loss reduces over whole rollout groups inside a micro batch, so the
     # trainer must not shuffle samples across micro batches.
     requires_whole_groups: bool = False
@@ -1885,6 +1887,7 @@ class CRDLoss(DiffusionLossFn):
     """
 
     uses_old_adapter = True
+    extra_ema_adapters = (("moving_reference", "reference_policy"),)
     requires_whole_groups = True
     required_model_output_keys = ("forward_prediction", "old_prediction", "ref_forward_prediction", "velocity_target")
     required_data_keys = ("advantages", "raw_rewards", "group_index", "group_size")
